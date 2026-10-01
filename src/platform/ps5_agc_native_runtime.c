@@ -1087,12 +1087,12 @@ static pthread_mutex_t runtime_shader_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t runtime_pair_lookups, runtime_pair_hot_hits;
 static uint64_t runtime_pair_scan_hits, runtime_pair_full;
 
-/* Prepared draws write every emitted command and own only these mutable state
- * pages. Shader code lives in the pair allocation; unused command capacity is
- * neither executed nor an upload. Downward scratch is published separately. */
+/* Prepared draws restore linked shader registers at 0x5000 and 0x6000 and
+ * initialize the completion marker at 0x6ff0. The 0x4000 page is unused in
+ * this path; shader code lives in the pair allocation. */
 static void runtime_prepared_work_clear(uint8_t *memory)
 {
-    memset(memory + 0x4000, 0, 0x4000);
+    memset(memory + 0x5000, 0, 0x2000);
 }
 
 static int runtime_prepared_work_publish(uint8_t *memory,
@@ -1103,7 +1103,7 @@ static int runtime_prepared_work_publish(uint8_t *memory,
         command->up < command->bottom || command->down < command->up ||
         command->down > command->top)
         return -1;
-    flush_gpu_data(memory + 0x4000, 0x4000);
+    flush_gpu_data(memory + 0x5000, 0x2000);
     flush_gpu_data(command->bottom, (size_t)(command->up - command->bottom) * 4);
     flush_gpu_data(command->down, (size_t)(command->top - command->down) * 4);
     return 0;
