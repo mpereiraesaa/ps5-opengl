@@ -31,7 +31,7 @@ scissor = re.sub(r"context->scissor_valid &\s+\(UINT16_C\(1\) << viewport_index\
 scissor = scissor.replace("&context->scissor[viewport_index]", "&context->scissor")
 scissor = scissor.replace("native->scissor[viewport_index]", "native->scissor")
 allocation = screen[screen.index("   if (PS5_ENABLE_SHARED_RENDER_POOL_CANDIDATE && ps5->render_pool &&"):]
-allocation = allocation[:allocation.index("   direct_limit = sceKernelGetDirectMemorySize();")]
+allocation = allocation[:allocation.index("   {\n      /* A system call with a fixed answer; ask it once. */")]
 target_extents = screen[screen.index("         target_widths[i] = surface->texture"):]
 target_extents = target_extents[:target_extents.index("         target_views[i]")]
 code = r'''

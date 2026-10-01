@@ -2485,12 +2485,22 @@ ps5_hash32(const void *data, size_t size)
 static uint64_t ps5_cpu_flush_calls, ps5_cpu_flush_bytes;
 #endif
 
+/* While a draw is staged into a deferred batch, its write-backs need not
+ * wait: the batch submission fences once before the GPU reads any of them. */
+static bool ps5_flush_unfenced;
+
 static void
 ps5_flush_gpu_data(const void *address, size_t bytes)
 {
    if (!bytes)
       return;
-   util_flush_inval_range((void *)address, bytes);
+   if (ps5_flush_unfenced) {
+      const uintptr_t end = (uintptr_t)address + bytes;
+      for (uintptr_t at = (uintptr_t)address & ~(uintptr_t)63; at < end; at += 64)
+         __asm__ volatile("clflushopt (%0)" : : "r"(at) : "memory");
+   } else {
+      util_flush_inval_range((void *)address, bytes);
+   }
 #ifdef PS5_DRAW_PROFILE
    __atomic_fetch_add(&ps5_cpu_flush_calls, 1, __ATOMIC_RELAXED);
    __atomic_fetch_add(&ps5_cpu_flush_bytes, bytes, __ATOMIC_RELAXED);
@@ -4981,7 +4991,13 @@ ps5_resource_create_unlocked(struct pipe_screen *screen,
          goto primary_ready;
       }
    }
-   direct_limit = sceKernelGetDirectMemorySize();
+   {
+      /* A system call with a fixed answer; ask it once. */
+      static int64_t direct_size;
+      if (!direct_size)
+         direct_size = sceKernelGetDirectMemorySize();
+      direct_limit = direct_size;
+   }
 #ifdef PS5_PUBLIC_STENCIL_TEST
    if (templ->format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT) {
       const unsigned layers = ps5_texture_level_layers(templ, 0);
@@ -11311,10 +11327,13 @@ ps5_batch_copy_descriptors(struct pipe_context *base,
           context->stream_output_target_count) {
          size_t begin = 0;
          const struct ps5_shader *shader = stage == 1 ? context->vs : context->fs;
-         /* Constant preparation clears this prefix before any consumer. Keep
-          * inline constants above it and retain layouts that do not clear it. */
+         /* Constant preparation clears this prefix before any consumer, and
+          * texture preparation rewrites every sampler descriptor the shader
+          * reads, so a shader without storage reads nothing stale below the
+          * inline constants. Keep the constants above it; layouts with
+          * storage or merged stages keep the whole snapshot. */
          if (stage && !context->gs && !context->tcs && !context->tes &&
-             shader && shader->nir->info.num_ubos && !ps5_shader_uses_storage(shader))
+             shader && !ps5_shader_uses_storage(shader))
             begin = PS5_CONSTANT_DATA_OFFSET;
          if (begin > live_bytes)
             return false;
@@ -11892,8 +11911,12 @@ ps5_try_deferred_draw(struct pipe_context *base,
       occlusion_query->buffer = ps5_deferred.slots[slot].occlusion_buffer;
    }
    context->last_draw_status = 0;
+#if !defined(PS5_ASYNC_NATIVE_PREP)
+   ps5_flush_unfenced = true;
+#endif
    ps5_draw_vbo_locked(base, info, drawid_offset, indirect, draws, num_draws,
                        &ps5_deferred.flush_cache, &submitted);
+   ps5_flush_unfenced = false;
    context->vertex_descriptor_table = saved[0];
    context->descriptor_storage[0] = saved[1];
    context->descriptor_storage[1] = saved[2];
@@ -16764,6 +16787,7 @@ ps5_context_destroy(struct pipe_context *base)
       base->screen->num_contexts--;
    free(context);
 }
+
 
 static struct pipe_context *
 ps5_context_create(struct pipe_screen *screen, void *priv, unsigned flags)

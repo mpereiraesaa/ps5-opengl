@@ -210,26 +210,52 @@ static unsigned submits, suspends, sleeps, unmaps, releases, delay;
 #ifdef PS5_DRAW_PROFILE
 static unsigned runtime_present_count = 30;
 static int64_t os_time_get_nano(void) { static int64_t ticks = 1; return ticks++; }
+static int64_t runtime_profile_now(void) { return os_time_get_nano(); }
 static void runtime_batch_profile_record(const int64_t ticks[5], unsigned waits, int result) {
     assert(waits == sleeps);
     if (!result) {
         assert(ticks[0] > 0); /* The production accumulator rejects zero origin. */
         for (unsigned i = 1; i < 5; ++i) assert(ticks[i] > ticks[i - 1]);
-        assert(unmaps == submits && releases == submits);
+        assert(unmaps >= submits && releases == unmaps); /* a merged batch submits once */
     }
 }
 #endif
 static int fail_submit, fail_suspend, fail_unmap, wrong_marker;
+/* Batch arena: one host buffer stands in for the mapped direct memory. */
+#define DIRECT_MEMORY_TYPE 12
+#define MAP_PROTECTION 0x33
+static uint32_t arena_memory[0x100000 / 4];
+static unsigned arena_maps, arena_fail;
+static int64_t sceKernelGetDirectMemorySize(void) { return 1; }
+static int32_t sceKernelAllocateDirectMemory(int64_t s, int64_t e, size_t n, size_t a, int t, int64_t *out) {
+    (void)s; (void)e; (void)a; (void)t; assert(n == sizeof(arena_memory));
+    if (arena_fail) return -1;
+    *out = 0x1000000; return 0;
+}
+static int32_t sceKernelMapDirectMemory(void **p, size_t n, int prot, int flags, int64_t d, size_t a) {
+    (void)prot; (void)flags; (void)a; assert(n == sizeof(arena_memory) && d == 0x1000000);
+    ++arena_maps; *p = arena_memory; return 0;
+}
+static uint32_t *arena_words; static unsigned arena_count;
 static int submit(void *p) {
     agc_submit_description_t *d = p;
     unsigned i = submits++;
+    if (d->words == arena_memory) {
+        arena_words = d->words; arena_count = d->word_count;
+        /* The merged stream completes with its last draw: retirement must
+         * read that marker (first entry's marker is never written by it). */
+        markers[0] = 101; markers[2] = 103; /* markers[0] only satisfies the munmap mock */
+        return 0;
+    }
     assert(d->words == memory[i] && d->word_count == 1 && !unmaps && !releases);
     if ((int)i == fail_submit) return -1;
     if (!delay) markers[i] = 101 + i;
     return 0;
 }
 static int suspend_point(void) { ++suspends; return fail_suspend; }
-static void flush_gpu_data(const void *p, size_t n) { assert(p && n == 8); }
+static void flush_gpu_data(const void *p, size_t n) { assert(p && (n == 8 || p == arena_memory)); }
+static unsigned publish_fences;
+static void runtime_publish_fence(void) { ++publish_fences; }
 static int sceKernelUsleep(uint32_t us) {
     assert(us == 1000 && !unmaps && !releases);
     if (++sleeps >= delay)
@@ -246,6 +272,7 @@ static int munmap(void *p, size_t n) {
     return fail_unmap;
 }
 static int sceKernelReleaseDirectMemory(int64_t p, size_t n) {
+    if (n == sizeof(arena_memory)) return 0;
     assert(p >= 0 && n == 64 && unmaps > releases); ++releases; return 0;
 }
 static jmp_buf exit_jump;
@@ -325,6 +352,45 @@ int main(void) {
         if (failure == 5)
             assert(ps5_agc_gate2_batch_begin() != 0 && ps5_agc_gate2_batch_end() != 0);
     }
+    /* Three draws with an upload prefix (2 words), a body and a completion
+     * tail become one stream: the first draw's prefix, every body, and only
+     * the last draw's tail; retirement waits for the last marker. */
+    reset();
+    static uint32_t words[3][8];
+    for (unsigned i = 0; i < 3; ++i)
+        for (unsigned w = 0; w < 6; ++w) words[i][w] = (i + 1) * 100 + w;
+    const agc_api_t arena_api = {submit, suspend_point};
+    assert(ps5_agc_gate2_batch_begin() == 0);
+    for (unsigned i = 0; i < 3; ++i) {
+        agc_submit_description_t d = {words[i], 6, 0, {0}};
+        /* words 0-1 prefix, 2-3 body, 4-5 completion tail */
+        const struct runtime_batch_entry entry = {d, memory[i], i * 64, 64, &markers[i], 101 + i, 4, 8, 2};
+        assert(runtime_batch_queue(&arena_api, &entry) == 0);
+    }
+    const unsigned fences_before = publish_fences;
+    assert(ps5_agc_gate2_batch_submit() == 0);
+    assert(publish_fences == fences_before + 1); /* one fence for the batch's write-backs */
+    const struct runtime_batch_entry *merged = &runtime_pending[runtime_pending_head].entries[0];
+    assert(merged->marker == &markers[2] && merged->expected == 103 &&
+           !runtime_pending[runtime_pending_head].entries[1].submit.word_count &&
+           !runtime_pending[runtime_pending_head].entries[2].submit.word_count);
+    assert(ps5_agc_gate2_batch_retire(1) == 1);
+    static const uint32_t expected[] = {100, 101, 102, 103, 202, 203, 302, 303, 304, 305};
+    assert(submits == 1 && arena_maps == 1 && arena_words == arena_memory &&
+           arena_count == sizeof(expected) / sizeof(expected[0]) &&
+           !memcmp(arena_memory, expected, sizeof(expected)));
+    assert(unmaps == 3 && releases == 3);
+    /* Without an arena the grouped path still submits every draw. */
+    reset(); arena_fail = 1; runtime_batch_arena[0] = NULL; runtime_batch_arena[1] = NULL;
+    assert(ps5_agc_gate2_batch_begin() == 0);
+    for (unsigned i = 0; i < 2; ++i) {
+        agc_submit_description_t d = {memory[i], 1, 0, {0}};
+        const struct runtime_batch_entry entry = {d, memory[i], i * 64, 64, &markers[i], 101 + i, 0, 0, 0};
+        assert(runtime_batch_queue(&arena_api, &entry) == 0);
+    }
+    delay = 1;
+    assert(ps5_agc_gate2_batch_end() == 0 && submits == 2);
+    arena_fail = 0;
 }
 '''
 with tempfile.TemporaryDirectory() as tmp:
@@ -858,6 +924,7 @@ deferred = source[start:source.index(
 fence_helpers = source[source.index("static uint64_t\nps5_draw_batch_fence_submit("):source.index("static bool\nps5_memory_overlaps(")]
 deferred = deferred.replace(fence_helpers, "")
 deferred_code = code[:code.index("int main(void) {")] + r'''
+static bool ps5_flush_unfenced; /* set while a draw is staged (ps5_flush_gpu_data) */
 static unsigned scanout_waits;
 static int scanout_wait(void) { assert(locked); ++scanout_waits; return 0; }
 static int (*ps5_agc_gate2_wait_present)(void) = scanout_wait;

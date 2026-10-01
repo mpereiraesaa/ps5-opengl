@@ -81,6 +81,14 @@ int main(void) {
  { struct ps5_resource *r=(void*)out[1];
    for(size_t j=0;j<PS5_CONSTANT_DATA_OFFSET;++j) assert(r->data[j]==0xcc);
    assert(!memcmp(r->data+PS5_CONSTANT_DATA_OFFSET,src[1].data+PS5_CONSTANT_DATA_OFFSET,64)); }
+ /* Without UBOs or storage, texture preparation rewrites every descriptor
+    the shader reads: only the inline data is copied as well. */
+ un.info.num_ubos=0; count=0;
+ assert(ps5_batch_copy_descriptors(&c.base,saved,out));
+ { struct ps5_resource *r=(void*)out[1];
+   for(size_t j=0;j<PS5_CONSTANT_DATA_OFFSET;++j) assert(r->data[j]==0xcc);
+   assert(!memcmp(r->data+PS5_CONSTANT_DATA_OFFSET,src[1].data+PS5_CONSTANT_DATA_OFFSET,64)); }
+ un.info.num_ubos=1;
  un.info.num_ssbos=1; count=0;
  assert(ps5_batch_copy_descriptors(&c.base,saved,out));
  assert(!memcmp(((struct ps5_resource *)out[1])->data,src[1].data,PS5_CONSTANT_DATA_OFFSET+64));

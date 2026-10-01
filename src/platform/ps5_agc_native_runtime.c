@@ -917,6 +917,8 @@ static uint8_t command_out_of_space(agc_command_buffer_t *, uint32_t, void *);
 
 #if defined(AGC_RUNTIME_PACKAGES)
 static void flush_gpu_data(const void *address, size_t bytes);
+static void flush_gpu_data_unfenced(const void *address, size_t bytes);
+static void runtime_publish_fence(void);
 #include "ps5_cache_profile.h"
 #ifdef PS5_DRAW_PROFILE
 #define flush_gpu_data(address, bytes) PS5_CACHE_MEASURE(flush_gpu_data, address, bytes)
@@ -1094,25 +1096,37 @@ static pthread_mutex_t runtime_shader_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t runtime_pair_lookups, runtime_pair_hot_hits;
 static uint64_t runtime_pair_scan_hits, runtime_pair_full;
 
-/* Prepared draws restore linked shader registers at 0x5000 and 0x6000 and
- * initialize the completion marker at 0x6ff0. The 0x4000 page is unused in
- * this path; shader code lives in the pair allocation. */
+/* Prepared draws restore linked shader registers at 0x5000 (34 records) and
+ * UCONFIG records at 0x6000 (at most 8), and initialize the completion marker
+ * at 0x6ff0. Every record read is written for each draw, so only these ranges
+ * are cleared and published; the 0x4000 page and the rest of the state pages
+ * are unused in this path, and shader code lives in the pair allocation. */
+#define RUNTIME_PREPARED_SHADER_BYTES (34u * 8u)
+#define RUNTIME_PREPARED_UCONFIG_BYTES 0x40u
+#define RUNTIME_PREPARED_MARKER_LINE 0x6fc0u
 static void runtime_prepared_work_clear(uint8_t *memory)
 {
-    memset(memory + 0x5000, 0, 0x2000);
+    memset(memory + 0x5000, 0, RUNTIME_PREPARED_SHADER_BYTES);
+    memset(memory + 0x6000, 0, RUNTIME_PREPARED_UCONFIG_BYTES);
+    memset(memory + RUNTIME_PREPARED_MARKER_LINE, 0, 0x40);
 }
 
+/* flush is flush_gpu_data, or flush_gpu_data_unfenced for a batched draw:
+ * the batch submission fences once for all of its draws. */
 static int runtime_prepared_work_publish(uint8_t *memory,
-                                          const agc_command_buffer_t *command)
+                                          const agc_command_buffer_t *command,
+                                          void (*flush)(const void *, size_t))
 {
     if (command->bottom != (uint32_t *)(memory + 0x8000) ||
         command->top != (uint32_t *)(memory + 0xc000) ||
         command->up < command->bottom || command->down < command->up ||
         command->down > command->top)
         return -1;
-    flush_gpu_data(memory + 0x5000, 0x2000);
-    flush_gpu_data(command->bottom, (size_t)(command->up - command->bottom) * 4);
-    flush_gpu_data(command->down, (size_t)(command->top - command->down) * 4);
+    flush(memory + 0x5000, RUNTIME_PREPARED_SHADER_BYTES);
+    flush(memory + 0x6000, RUNTIME_PREPARED_UCONFIG_BYTES);
+    flush(memory + RUNTIME_PREPARED_MARKER_LINE, 0x40);
+    flush(command->bottom, (size_t)(command->up - command->bottom) * 4);
+    flush(command->down, (size_t)(command->top - command->down) * 4);
     return 0;
 }
 
@@ -1675,11 +1689,102 @@ static int runtime_batch_queue(const agc_api_t *api,
     return runtime_batch_append(api, entry);
 }
 
+/* One command arena per in-flight batch slot. A slot is reused only after its
+ * batch retired, so the arena never changes under the GPU. */
+#define RUNTIME_BATCH_ARENA_BYTES 0x100000u
+static uint32_t *runtime_batch_arena[PS5_INFLIGHT_BATCH_CAPACITY];
+
+static uint32_t *runtime_batch_arena_get(unsigned slot)
+{
+    if (!runtime_batch_arena[slot]) {
+        int64_t start = -1;
+        void *memory = NULL;
+        if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(),
+                                          RUNTIME_BATCH_ARENA_BYTES, 0x4000,
+                                          DIRECT_MEMORY_TYPE, &start) != 0)
+            return NULL;
+        if (sceKernelMapDirectMemory(&memory, RUNTIME_BATCH_ARENA_BYTES,
+                                     MAP_PROTECTION, 0, start, 0x4000) != 0 ||
+            !memory) {
+            sceKernelReleaseDirectMemory(start, RUNTIME_BATCH_ARENA_BYTES);
+            return NULL;
+        }
+        runtime_batch_arena[slot] = memory;
+    }
+    return runtime_batch_arena[slot];
+}
+
+/* Upload words skipped from a follower: the batch's first acquire already
+ * covers every upload, which is published before the batch is submitted. */
+static uint32_t runtime_batch_follower_skip(const struct runtime_batch_entry *first,
+                                            const struct runtime_batch_entry *entry)
+{
+    return first->upload_prefix_words &&
+           entry->upload_prefix_words < entry->completion_offset
+        ? entry->upload_prefix_words : 0;
+}
+
+/* Submit the whole batch as one command stream: the first draw's upload
+ * acquire, every draw body with its dependency barriers, and only the last
+ * draw's completion. Separate submissions each invalidated and flushed the
+ * GPU caches and drained the pipeline, which made the GPU the bottleneck for
+ * scenes of many small draws. Returns 0 to keep the grouped path. */
+static int runtime_batch_combine_arena(void)
+{
+    struct runtime_batch_entry *first = &runtime_batch_entries[0];
+    struct runtime_batch_entry *last = &runtime_batch_entries[runtime_batch_count - 1];
+    size_t words = 0;
+
+    if (runtime_batch_count < 2)
+        return 0;
+    for (unsigned i = 0; i < runtime_batch_count; ++i) {
+        const struct runtime_batch_entry *entry = &runtime_batch_entries[i];
+        if (!entry->completion_offset ||
+            entry->completion_offset >= entry->submit.word_count ||
+            entry->submit.word_count > entry->command_capacity ||
+            entry->submit.flag != first->submit.flag)
+            return 0;
+        words += entry->completion_offset - (i ? runtime_batch_follower_skip(first, entry) : 0);
+    }
+    words += last->submit.word_count - last->completion_offset;
+    if (words > RUNTIME_BATCH_ARENA_BYTES / sizeof(uint32_t))
+        return 0;
+    uint32_t *arena = runtime_batch_arena_get(
+        (runtime_pending_head + runtime_pending_batches) % PS5_INFLIGHT_BATCH_CAPACITY);
+    if (!arena)
+        return 0;
+
+    uint32_t *at = arena;
+    for (unsigned i = 0; i < runtime_batch_count; ++i) {
+        const struct runtime_batch_entry *entry = &runtime_batch_entries[i];
+        const uint32_t skip = i ? runtime_batch_follower_skip(first, entry) : 0;
+        memcpy(at, (const uint32_t *)entry->submit.words + skip,
+               (size_t)(entry->completion_offset - skip) * sizeof(uint32_t));
+        at += entry->completion_offset - skip;
+    }
+    memcpy(at, (const uint32_t *)last->submit.words + last->completion_offset,
+           (size_t)(last->submit.word_count - last->completion_offset) * sizeof(uint32_t));
+    at += last->submit.word_count - last->completion_offset;
+
+    /* The first entry carries the stream; retirement waits for the last
+     * draw's marker. Every allocation stays retained until then. */
+    first->submit.words = arena;
+    first->submit.word_count = (uint32_t)(at - arena);
+    first->marker = last->marker;
+    first->expected = last->expected;
+    for (unsigned i = 1; i < runtime_batch_count; ++i)
+        runtime_batch_entries[i].submit.word_count = 0;
+    flush_gpu_data(arena, (size_t)(at - arena) * sizeof(uint32_t));
+    return 1;
+}
+
 /* Keep draw bodies and their dependency barriers. Fixed-framebuffer batches
  * may also move their post-draw color/depth releases to the group boundary;
  * all other batches retain those releases per draw. No allocation is freed. */
 static unsigned runtime_batch_combine(void)
 {
+    if (runtime_batch_combine_arena())
+        return 1;
     unsigned groups = 0;
     struct runtime_batch_entry *leader = NULL;
     for (unsigned i = 0; i < runtime_batch_count; ++i) {
@@ -1757,6 +1862,7 @@ int ps5_agc_gate2_batch_submit(void)
         ((volatile uint64_t *)((uint8_t *)e->memory + e->bytes - 0x4000))[8] = os_time_get_nano();
     }
 #endif
+    runtime_publish_fence(); /* Completes every staged draw's write-back. */
     for (unsigned i = 0; i < runtime_batch_count; ++i) {
         ++attempted; /* A failed submit is conservatively treated as in flight. */
         if (!runtime_batch_entries[i].submit.word_count)
@@ -2768,6 +2874,20 @@ static void (flush_gpu_data)(const void *address, size_t bytes)
 #endif
 }
 
+/* Write back and invalidate without waiting: only for data the GPU reads
+ * after a later submission, which runtime_publish_fence() orders. */
+static void flush_gpu_data_unfenced(const void *address, size_t bytes)
+{
+    const uintptr_t end = (uintptr_t)address + bytes;
+    for (uintptr_t at = (uintptr_t)address & ~(uintptr_t)63; bytes && at < end; at += 64)
+        __asm__ volatile("clflushopt (%0)" : : "r"(at) : "memory");
+}
+
+static void runtime_publish_fence(void)
+{
+    __asm__ volatile("mfence" ::: "memory");
+}
+
 #if (defined(AGC_RENDER_TO_TEXTURE_VARIANT) || \
      defined(AGC_CLEAR_TEST_VARIANT)) && defined(AGC_TRIANGLE_SUBMIT)
 static size_t tiled_rgba8_offset(uint32_t x, uint32_t y,
@@ -3064,6 +3184,10 @@ static int append_target_state(agc_register_t *cx, uint32_t *cx_count,
         0x318, 0x31b, 0x31c, 0x31d, 0x31e, 0x31f, 0x321, 0x323,
         0x324, 0x325, 0x390, 0x398, 0x3a0, 0x3a8, 0x3b0, 0x3b8
     };
+    /* The defaults table is fixed, so its 16 target values are looked up once
+     * per table instead of rescanning it on every draw. */
+    static const void *cached_defaults;
+    static uint32_t cached_values[16];
     agc_register_t **blocks = *(agc_register_t ***)defaults;
     uint32_t default_count = *(uint32_t *)((uint8_t *)defaults + 0x20);
     uint32_t index;
@@ -3072,6 +3196,11 @@ static int append_target_state(agc_register_t *cx, uint32_t *cx_count,
         return -1;
     for (index = 0; index < 16; ++index)
         cx[index] = (agc_register_t){target_offsets[index], 0, 0};
+    if (__atomic_load_n(&cached_defaults, __ATOMIC_ACQUIRE) == defaults) {
+        for (index = 0; index < 16; ++index)
+            cx[index].value = cached_values[index];
+        goto defaults_ready;
+    }
     /* Read each default once instead of rescanning the table for every target
      * register. Keep the first occurrence, matching the original lookup. */
     uint32_t found = 0;
@@ -3102,7 +3231,12 @@ static int append_target_state(agc_register_t *cx, uint32_t *cx_count,
     }
     if (found != 0xffffu)
         return -1;
+    for (index = 0; index < 16; ++index)
+        cached_values[index] = cx[index].value;
+    /* Async preparation workers may fill it concurrently with equal values. */
+    __atomic_store_n(&cached_defaults, defaults, __ATOMIC_RELEASE);
 
+defaults_ready:
     cx[0].value = (uint32_t)((uintptr_t)target >> 8);
     cx[1].value &= 0xfc001fffu;
     cx[2].value = (cx[2].value &
@@ -3834,8 +3968,13 @@ int main(void)
 #else
     init_rc = agc.init(8);
 #endif
-    if (init_rc == 0)
-        direct_limit = sceKernelGetDirectMemorySize();
+    if (init_rc == 0) {
+        /* A system call with a fixed answer; draws used to pay it each time. */
+        static int64_t direct_size;
+        if (!direct_size)
+            direct_size = sceKernelGetDirectMemorySize();
+        direct_limit = direct_size;
+    }
     /* libkernel_web reports zero in the payload-loader context; the proven
      * allocation contract accepts (search_start, search_end) == (0, 0). */
     if (init_rc != 0)
@@ -4387,7 +4526,10 @@ int main(void)
         runtime_depth_buffer_size >= DEPTH_BYTES)
         append_depth_target_state(cx, &cx_count, runtime_depth_buffer,
                                   runtime_stencil_buffer);
-    if (getenv("PSBC_DEBUG_IO"))
+    static int debug_io = -1; /* getenv() scans the environment; ask once. */
+    if (debug_io < 0)
+        debug_io = getenv("PSBC_DEBUG_IO") != NULL;
+    if (debug_io)
         printf("[ps5-linkage] vs-out=%08x ps-in=%08x inputs=%08x/%08x/%08x/%08x\n",
                last_register_value(cx, cx_count, 0x1b1),
                last_register_value(cx, cx_count, 0x1b6),
@@ -4902,7 +5044,14 @@ int main(void)
 #if defined(PS5_NATIVE_TITLE_RUNTIME) && defined(PS5_MULTIDRAW_BATCH) && \
     !defined(PS5_DRAW_GPU_TIMESTAMPS) && !defined(AGC_RUNTIME_DIAGNOSTICS)
     if (prepared) {
-        if (runtime_prepared_work_publish(memory, &command) != 0)
+        if (runtime_prepared_work_publish(memory, &command,
+#ifdef PS5_ASYNC_NATIVE_PREP
+                                          /* A worker's write-backs need its own fence. */
+                                          flush_gpu_data) != 0)
+#else
+                                          runtime_batch_active ? flush_gpu_data_unfenced
+                                                               : flush_gpu_data) != 0)
+#endif
             goto receipt;
     } else
 #endif
@@ -4938,6 +5087,7 @@ int main(void)
 #ifdef PS5_DRAW_GPU_TIMESTAMPS
         ((volatile uint64_t *)(memory + work_bytes - 0x4000))[8] = os_time_get_nano();
 #endif
+        runtime_publish_fence(); /* Gallium may have staged write-backs unfenced. */
         int submit_rc = agc.submit(&submit);
         PS5_PROFILE_MARK(6);
 #ifdef PS5_FRAME_SUSPEND
