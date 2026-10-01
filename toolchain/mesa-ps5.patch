@@ -838,3 +838,23 @@ diff --git a/src/mesa/state_tracker/st_draw.c b/src/mesa/state_tracker/st_draw.c
     /* Find consecutive draws where mode doesn't vary. */
     for (i = 0, first = 0; i <= num_draws; i++) {
        if (i == num_draws || mode[i] != mode[first]) {
+diff --git a/src/mesa/main/texstate.c b/src/mesa/main/texstate.c
+--- a/src/mesa/main/texstate.c
++++ b/src/mesa/main/texstate.c
+@@ -322,8 +322,15 @@
+     * needed to find the root cause.
+     *
+     * https://bugs.freedesktop.org/show_bug.cgi?id=105436
++    *
++    * PS5: keep the state flags but not the vertex flush. Pending vertices
++    * do not depend on the active unit (glTexCoord feeds unit 0), and every
++    * call that changes a unit's state flushes before it does. Games that
++    * select unit 0 and 1 around each glBegin/glEnd (Quake-engine
++    * multitexturing) would otherwise draw one primitive per draw call.
+     */
+-   FLUSH_VERTICES(ctx, _NEW_TEXTURE_STATE, GL_TEXTURE_BIT);
++   ctx->NewState |= _NEW_TEXTURE_STATE;
++   ctx->PopAttribState |= GL_TEXTURE_BIT;
+ 
+    ctx->Texture.CurrentUnit = texUnit;
+    if (ctx->Transform.MatrixMode == GL_TEXTURE) {
