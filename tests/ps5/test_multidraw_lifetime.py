@@ -440,7 +440,7 @@ code = r'''
 #define PS5_RENDER_ARENA_OFFSET (2u * 0xa00000u)
 #define PS5_CONSTANT_DATA_OFFSET 16u /* Scaled prefix for the 64-byte ownership fixture. */
 enum { PIPE_MAX_ATTRIBS=16, PS5_MAX_CONSTANT_BUFFERS=13, PS5_MAX_TEXTURE_UNITS=16, PS5_MAX_RENDER_TARGETS=8, PIPE_BUFFER=1,
-       PIPE_TEXTURE_2D=2, PIPE_TEXTURE_2D_ARRAY=3, PIPE_FORMAT_R8G8B8A8_UNORM=1, MESA_PRIM_TRIANGLES=4, MESA_PRIM_TRIANGLE_FAN=5, PIPE_BIND_DISPLAY_TARGET=1,
+       PIPE_TEXTURE_2D=2, PIPE_TEXTURE_2D_ARRAY=3, PIPE_FORMAT_R8G8B8A8_UNORM=1, MESA_PRIM_LINES=1, MESA_PRIM_TRIANGLES=4, MESA_PRIM_TRIANGLE_STRIP=5, MESA_PRIM_TRIANGLE_FAN=6, PIPE_BIND_DISPLAY_TARGET=1,
        PIPE_FORMAT_Z32_FLOAT=77, PIPE_FORMAT_Z32_FLOAT_S8X24_UINT=78, PIPE_MAX_VERTEX_STREAMS=4,
        PIPE_FORMAT_X32_S8X24_UINT=79, PIPE_BIND_RENDER_TARGET=2, PIPE_BIND_DEPTH_STENCIL=4 };
 struct pipe_resource { unsigned target, format, nr_samples, nr_storage_samples, refs, last_level, bind, array_size, width0; };
@@ -897,24 +897,23 @@ int main(void) {
     reset();
     ps5_context_queue_present(&context.base, 1); /* Empty queue: unchanged CPU fallback. */
     struct pipe_draw_info fan={.mode=MESA_PRIM_TRIANGLE_FAN,.instance_count=1};
+    struct pipe_draw_info strip={.mode=MESA_PRIM_TRIANGLE_STRIP,.instance_count=1,.has_user_indices=true};
     struct pipe_draw_start_count_bias quad={0,4,0};
-    assert(!ps5_try_deferred_draw(&context.base,&fan,20,NULL,&quad,1));
-    context.deferred_blitter_draw=true;
-    assert(!ps5_try_deferred_draw(&context.base,&fan,20,NULL,&quad,1));
+    assert(ps5_multidraw_eligible(&context,&fan,NULL,&quad,1));
+    assert(ps5_multidraw_eligible(&context,&strip,NULL,&quad,1));
     __typeof__(*context.blitter) blitter={.running=true};
     context.blitter=&blitter;
-    for (unsigned invalid=0;invalid<7;++invalid) {
+    assert(!ps5_try_deferred_draw(&context.base,&fan,20,NULL,&quad,1));
+    context.deferred_blitter_draw=true;
+    for (unsigned invalid=0;invalid<5;++invalid) {
         struct pipe_draw_info f=fan;
         struct pipe_draw_start_count_bias q=quad;
-        if (invalid==0) context.deferred_blitter_draw=false;
-        if (invalid==1) f.index_size=2;
-        if (invalid==2) f.instance_count=2;
-        if (invalid==3) f.start_instance=1;
-        if (invalid==4) q.count=3;
-        if (invalid==5) q.start=1;
-        if (invalid==6) blitter.running=false;
+        if (invalid==0) f.mode=MESA_PRIM_LINES;
+        if (invalid==1) f.index_size=2; /* Missing index resource. */
+        if (invalid==2) f.instance_count=0;
+        if (invalid==3) f.primitive_restart=true;
+        if (invalid==4) { f.index_size=2; f.index.resource=&borrowed.base; f.has_user_indices=true; }
         assert(!ps5_try_deferred_draw(&context.base,&f,20,NULL,&q,1));
-        context.deferred_blitter_draw=true; blitter.running=true;
     }
     assert(ps5_try_deferred_draw(&context.base,&fan,20,NULL,&quad,1));
     context.deferred_blitter_draw=false; blitter.running=false;
