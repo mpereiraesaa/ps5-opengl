@@ -12017,6 +12017,29 @@ ps5_draw_vbo(struct pipe_context *base, const struct pipe_draw_info *info,
    if (info && (info->mode == MESA_PRIM_QUADS ||
                 info->mode == MESA_PRIM_QUAD_STRIP ||
                 info->mode == MESA_PRIM_POLYGON)) {
+      /* A non-indexed filled convex GL_POLYGON is already a fan.  The normal
+       * conversion allocates an index upload and a primconvert context for
+       * each tiny immediate-mode draw, which is Half-Life's dominant mode. */
+      const struct pipe_rasterizer_state *rast = context->rasterizer;
+      if (info->mode == MESA_PRIM_POLYGON && !indirect && num_draws == 1 &&
+          draws && draws[0].count >= 3 && !draws[0].index_bias &&
+          !info->index_size && !info->primitive_restart && rast &&
+          rast->fill_front == PIPE_POLYGON_MODE_FILL &&
+          rast->fill_back == PIPE_POLYGON_MODE_FILL && !rast->flatshade &&
+          !rast->poly_stipple_enable && !rast->poly_smooth &&
+          !rast->conservative_raster_mode &&
+          !context->gs && !context->tcs && !context->tes &&
+          !context->stream_output_target_count &&
+          !ps5_any_primitive_query(context) &&
+          context->fs &&
+          !(context->fs->nir->info.inputs_read & VARYING_BIT_PRIMITIVE_ID) &&
+          !BITSET_TEST(context->fs->nir->info.system_values_read,
+                       SYSTEM_VALUE_PRIMITIVE_ID)) {
+         struct pipe_draw_info fan = *info;
+         fan.mode = MESA_PRIM_TRIANGLE_FAN;
+         base->draw_vbo(base, &fan, drawid_offset, NULL, draws, 1);
+         return;
+      }
       struct primconvert_config cfg = {
          .primtypes_mask = base->screen->caps.supported_prim_modes &
             ~(BITFIELD_BIT(MESA_PRIM_QUADS) |
