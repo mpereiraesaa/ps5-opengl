@@ -12,6 +12,13 @@
 #include <dlfcn.h>
 #include <inttypes.h>
 #include <stdint.h>
+#include <x86intrin.h>
+/* Profile timestamps in ns from the TSC (1.6 GHz on the console): the PS5's
+ * clock_gettime() is a system call, and a draw took about ten of them. */
+static inline int64_t runtime_profile_now(void)
+{
+    return (int64_t)(__rdtsc() * 5 / 8);
+}
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1721,7 +1728,7 @@ int ps5_agc_gate2_batch_submit(void)
     int result = 0;
 #ifdef PS5_DRAW_PROFILE
     int64_t ticks[3] = {0};
-#define BATCH_SUBMIT_MARK(i) ticks[i] = os_time_get_nano()
+#define BATCH_SUBMIT_MARK(i) ticks[i] = runtime_profile_now()
 #else
 #define BATCH_SUBMIT_MARK(i) ((void)0)
 #endif
@@ -2038,7 +2045,7 @@ static void runtime_profile_report(void)
     memset(runtime_prepare_profile_ns, 0, sizeof(runtime_prepare_profile_ns));
     runtime_prepare_profile_calls = runtime_prepare_profile_failures = 0;
 }
-#define PS5_PROFILE_MARK(i) profile_ticks[i] = os_time_get_nano()
+#define PS5_PROFILE_MARK(i) profile_ticks[i] = runtime_profile_now()
 #endif
 
 static int64_t runtime_next_render_marker(void)
@@ -3039,6 +3046,17 @@ static int load_apis(void *agc_module, void *driver_module,
 #endif
 }
 
+/* sceAgcGetRegisterDefaults() costs about 9 us per call on the console and
+ * returns the same fixed table every time; a draw used to call it once. */
+static void *runtime_register_defaults(void *(*get_defaults)(void))
+{
+    static void *defaults;
+
+    if (!defaults)
+        defaults = get_defaults();
+    return defaults;
+}
+
 static int append_target_state(agc_register_t *cx, uint32_t *cx_count,
                                void *defaults, void *target)
 {
@@ -3368,7 +3386,9 @@ static int build_frame_slot_command(const agc_api_t *agc, int video_handle,
     uint32_t vertex_user_data[GATE3_BIND_USER_SGPR_COUNT];
     uint32_t pixel_user_data[GATE3_TEXTURE_PS_USER_SGPR_COUNT];
 
-    if (append_target_state(cx, &cx_count, agc->get_defaults(), target) != 0 ||
+    if (append_target_state(cx, &cx_count,
+                            runtime_register_defaults(agc->get_defaults),
+                            target) != 0 ||
         append_shader_state(shared_memory, vertex, pixel, cx, &cx_count,
                             sh, &sh_count) != 0)
         return -1;
@@ -4324,7 +4344,8 @@ int main(void)
     cx = (agc_register_t *)(memory + 0x7000);
     sh = (agc_register_t *)(memory + 0x7800);
     words = (uint32_t *)(memory + 0x8000);
-    if (append_target_state(cx, &cx_count, agc.get_defaults(),
+    if (append_target_state(cx, &cx_count,
+                            runtime_register_defaults(agc.get_defaults),
 #ifdef AGC_OFFSCREEN_COLOR_VARIANT
                             offscreen) != 0 ||
 #else
@@ -4354,7 +4375,8 @@ int main(void)
 #ifdef AGC_RENDER_TO_TEXTURE_VARIANT
     scanout_cx = (agc_register_t *)(memory + 0x4800);
     if (append_target_state(scanout_cx, &scanout_cx_count,
-                            agc.get_defaults(), framebuffer) != 0)
+                            runtime_register_defaults(agc.get_defaults),
+                            framebuffer) != 0)
         goto receipt;
 #endif
 #ifdef AGC_DEPTH_TEST_VARIANT
