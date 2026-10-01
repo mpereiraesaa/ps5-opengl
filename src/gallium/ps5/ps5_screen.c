@@ -11129,11 +11129,9 @@ ps5_multidraw_eligible(struct ps5_context *context,
 
    if (!info || !draws || !num_draws || indirect ||
        (info->mode != MESA_PRIM_TRIANGLES &&
-        !(context->deferred_blitter_draw && context->blitter && context->blitter->running &&
-          info->mode == MESA_PRIM_TRIANGLE_FAN && num_draws == 1 &&
-          !info->index_size && info->instance_count == 1 && !info->start_instance &&
-          draws[0].start == 0 && draws[0].count == 4)) || !info->instance_count ||
-       info->primitive_restart || info->has_user_indices ||
+        info->mode != MESA_PRIM_TRIANGLE_FAN &&
+        info->mode != MESA_PRIM_TRIANGLE_STRIP) || !info->instance_count ||
+       info->primitive_restart || (info->index_size && info->has_user_indices) ||
        (info->index_size && info->index_size != 2 && info->index_size != 4) ||
        (info->index_size && !info->index.resource))
       rejects |= BITFIELD_BIT(PS5_BATCH_REJECT_INPUT - 1);
@@ -12079,18 +12077,41 @@ ps5_draw_vbo(struct pipe_context *base, const struct pipe_draw_info *info,
       context->legacy_flat_input_vertex = (triangle & 1u) ? 1 : 2;
    }
 
+   /* Client indices must live in a pipe resource before a queued draw can
+    * retain them. The synchronous path already uploads them; do it before
+    * batch eligibility so vbo_exec draws can take the same path. */
+   if (info && draws && num_draws == 1 && !indirect &&
+       !info->primitive_restart && info->index_size && info->has_user_indices) {
+      if (!util_upload_index_buffer(base, info, &draws[0],
+                                    &uploaded_indices, &uploaded_offset, 4)) {
+         context->last_draw_status = -2;
+         printf("[ps5-gallium] user-index-upload-failed\n");
+         return;
+      }
+      uploaded_info = *info;
+      uploaded_info.index.resource = uploaded_indices;
+      uploaded_info.has_user_indices = false;
+      uploaded_draw = draws[0];
+      uploaded_draw.start += uploaded_offset / info->index_size;
+      info = &uploaded_info;
+      draws = &uploaded_draw;
+   }
 #ifdef PS5_DEFERRED_DRAW_BATCH
-   if (!context->legacy_primitive_conversion &&
-       ps5_try_deferred_draw(base, info, drawid_offset, indirect, draws, num_draws))
+   if (ps5_try_deferred_draw(base, info, drawid_offset, indirect, draws, num_draws)) {
+      pipe_resource_reference(&uploaded_indices, NULL);
       return;
+   }
 #endif
 #ifdef PS5_MULTIDRAW_BATCH
    if (num_draws > 1 && ps5_try_multi_draw_batch(
-          base, info, drawid_offset, indirect, draws, num_draws))
+          base, info, drawid_offset, indirect, draws, num_draws)) {
+      pipe_resource_reference(&uploaded_indices, NULL);
       return;
+   }
 #endif
    if (num_draws > 1) {
       util_draw_multi(base, info, drawid_offset, indirect, draws, num_draws);
+      pipe_resource_reference(&uploaded_indices, NULL);
       return;
    }
    if (info && info->primitive_restart) {
@@ -12110,23 +12131,8 @@ ps5_draw_vbo(struct pipe_context *base, const struct pipe_draw_info *info,
       context->last_draw_status = 0;
       util_primconvert_draw_vbo(converter, info, drawid_offset, indirect, draws, num_draws);
       util_primconvert_destroy(converter);
+      pipe_resource_reference(&uploaded_indices, NULL);
       return;
-   }
-   if (info && draws && !indirect && info->index_size &&
-       info->has_user_indices) {
-      if (!util_upload_index_buffer(base, info, &draws[0],
-                                    &uploaded_indices, &uploaded_offset, 4)) {
-         context->last_draw_status = -2;
-         printf("[ps5-gallium] user-index-upload-failed\n");
-         return;
-      }
-      uploaded_info = *info;
-      uploaded_info.index.resource = uploaded_indices;
-      uploaded_info.has_user_indices = false;
-      uploaded_draw = draws[0];
-      uploaded_draw.start += uploaded_offset / info->index_size;
-      info = &uploaded_info;
-      draws = &uploaded_draw;
    }
    if (info && draws && !indirect && !((struct ps5_context *)base)->gs &&
        (info->mode == MESA_PRIM_LINES_ADJACENCY ||
