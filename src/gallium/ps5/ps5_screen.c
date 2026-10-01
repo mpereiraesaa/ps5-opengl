@@ -11327,10 +11327,13 @@ ps5_batch_copy_descriptors(struct pipe_context *base,
           context->stream_output_target_count) {
          size_t begin = 0;
          const struct ps5_shader *shader = stage == 1 ? context->vs : context->fs;
-         /* Constant preparation clears this prefix before any consumer. Keep
-          * inline constants above it and retain layouts that do not clear it. */
+         /* Constant preparation clears this prefix before any consumer, and
+          * texture preparation rewrites every sampler descriptor the shader
+          * reads, so a shader without storage reads nothing stale below the
+          * inline constants. Keep the constants above it; layouts with
+          * storage or merged stages keep the whole snapshot. */
          if (stage && !context->gs && !context->tcs && !context->tes &&
-             shader && shader->nir->info.num_ubos && !ps5_shader_uses_storage(shader))
+             shader && !ps5_shader_uses_storage(shader))
             begin = PS5_CONSTANT_DATA_OFFSET;
          if (begin > live_bytes)
             return false;
