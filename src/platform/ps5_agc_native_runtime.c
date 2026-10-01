@@ -1675,11 +1675,102 @@ static int runtime_batch_queue(const agc_api_t *api,
     return runtime_batch_append(api, entry);
 }
 
+/* One command arena per in-flight batch slot. A slot is reused only after its
+ * batch retired, so the arena never changes under the GPU. */
+#define RUNTIME_BATCH_ARENA_BYTES 0x100000u
+static uint32_t *runtime_batch_arena[PS5_INFLIGHT_BATCH_CAPACITY];
+
+static uint32_t *runtime_batch_arena_get(unsigned slot)
+{
+    if (!runtime_batch_arena[slot]) {
+        int64_t start = -1;
+        void *memory = NULL;
+        if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(),
+                                          RUNTIME_BATCH_ARENA_BYTES, 0x4000,
+                                          DIRECT_MEMORY_TYPE, &start) != 0)
+            return NULL;
+        if (sceKernelMapDirectMemory(&memory, RUNTIME_BATCH_ARENA_BYTES,
+                                     MAP_PROTECTION, 0, start, 0x4000) != 0 ||
+            !memory) {
+            sceKernelReleaseDirectMemory(start, RUNTIME_BATCH_ARENA_BYTES);
+            return NULL;
+        }
+        runtime_batch_arena[slot] = memory;
+    }
+    return runtime_batch_arena[slot];
+}
+
+/* Upload words skipped from a follower: the batch's first acquire already
+ * covers every upload, which is published before the batch is submitted. */
+static uint32_t runtime_batch_follower_skip(const struct runtime_batch_entry *first,
+                                            const struct runtime_batch_entry *entry)
+{
+    return first->upload_prefix_words &&
+           entry->upload_prefix_words < entry->completion_offset
+        ? entry->upload_prefix_words : 0;
+}
+
+/* Submit the whole batch as one command stream: the first draw's upload
+ * acquire, every draw body with its dependency barriers, and only the last
+ * draw's completion. Separate submissions each invalidated and flushed the
+ * GPU caches and drained the pipeline, which made the GPU the bottleneck for
+ * scenes of many small draws. Returns 0 to keep the grouped path. */
+static int runtime_batch_combine_arena(void)
+{
+    struct runtime_batch_entry *first = &runtime_batch_entries[0];
+    struct runtime_batch_entry *last = &runtime_batch_entries[runtime_batch_count - 1];
+    size_t words = 0;
+
+    if (runtime_batch_count < 2)
+        return 0;
+    for (unsigned i = 0; i < runtime_batch_count; ++i) {
+        const struct runtime_batch_entry *entry = &runtime_batch_entries[i];
+        if (!entry->completion_offset ||
+            entry->completion_offset >= entry->submit.word_count ||
+            entry->submit.word_count > entry->command_capacity ||
+            entry->submit.flag != first->submit.flag)
+            return 0;
+        words += entry->completion_offset - (i ? runtime_batch_follower_skip(first, entry) : 0);
+    }
+    words += last->submit.word_count - last->completion_offset;
+    if (words > RUNTIME_BATCH_ARENA_BYTES / sizeof(uint32_t))
+        return 0;
+    uint32_t *arena = runtime_batch_arena_get(
+        (runtime_pending_head + runtime_pending_batches) % PS5_INFLIGHT_BATCH_CAPACITY);
+    if (!arena)
+        return 0;
+
+    uint32_t *at = arena;
+    for (unsigned i = 0; i < runtime_batch_count; ++i) {
+        const struct runtime_batch_entry *entry = &runtime_batch_entries[i];
+        const uint32_t skip = i ? runtime_batch_follower_skip(first, entry) : 0;
+        memcpy(at, (const uint32_t *)entry->submit.words + skip,
+               (size_t)(entry->completion_offset - skip) * sizeof(uint32_t));
+        at += entry->completion_offset - skip;
+    }
+    memcpy(at, (const uint32_t *)last->submit.words + last->completion_offset,
+           (size_t)(last->submit.word_count - last->completion_offset) * sizeof(uint32_t));
+    at += last->submit.word_count - last->completion_offset;
+
+    /* The first entry carries the stream; retirement waits for the last
+     * draw's marker. Every allocation stays retained until then. */
+    first->submit.words = arena;
+    first->submit.word_count = (uint32_t)(at - arena);
+    first->marker = last->marker;
+    first->expected = last->expected;
+    for (unsigned i = 1; i < runtime_batch_count; ++i)
+        runtime_batch_entries[i].submit.word_count = 0;
+    flush_gpu_data(arena, (size_t)(at - arena) * sizeof(uint32_t));
+    return 1;
+}
+
 /* Keep draw bodies and their dependency barriers. Fixed-framebuffer batches
  * may also move their post-draw color/depth releases to the group boundary;
  * all other batches retain those releases per draw. No allocation is freed. */
 static unsigned runtime_batch_combine(void)
 {
+    if (runtime_batch_combine_arena())
+        return 1;
     unsigned groups = 0;
     struct runtime_batch_entry *leader = NULL;
     for (unsigned i = 0; i < runtime_batch_count; ++i) {
