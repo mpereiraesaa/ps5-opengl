@@ -71,6 +71,18 @@ static int munmap(void *p,size_t n) {
 static int sceKernelReleaseDirectMemory(int64_t p,size_t n) {
     assert(p>=0 && n==64 && unmaps>releases); ++releases; return 0;
 }
+/* No batch arena: this harness covers the grouped submission fallback. */
+#define COMMAND_BYTES 0x4000u
+#define DIRECT_MEMORY_TYPE 12
+#define MAP_PROTECTION 0x33
+static int64_t sceKernelGetDirectMemorySize(void) { return 1; }
+static int32_t sceKernelAllocateDirectMemory(int64_t s,int64_t e,size_t n,size_t a,int t,int64_t *o) {
+    (void)s; (void)e; (void)n; (void)a; (void)t; (void)o; return -1;
+}
+static int32_t sceKernelMapDirectMemory(void **p,size_t n,int pr,int f,int64_t d,size_t a) {
+    (void)p; (void)n; (void)pr; (void)f; (void)d; (void)a; assert(!"no arena is mapped"); return -1;
+}
+static void runtime_publish_fence(void) {}
 ''' + body + r'''
 static void reset(unsigned count) {
     memset(runtime_batch_entries,0,sizeof(runtime_batch_entries));

@@ -33,7 +33,7 @@ struct util_cpu_caps_t { unsigned has_clflushopt, cacheline; };
 static struct util_cpu_caps_t caps={0,64};
 static const struct util_cpu_caps_t *util_get_cpu_caps(void) { return &caps; }
 static uintptr_t lines[32]; static unsigned line_count,fences,optimized;
-'''+cache+flush+native+r'''
+'''+cache+'static bool ps5_flush_unfenced; /* off: the fenced path */\n'+flush+native+r'''
 struct ps5_resource { struct { unsigned target; } base; size_t size; };
 struct vertex_buffer { unsigned buffer_offset; struct { struct ps5_resource *resource; } buffer; };
 struct element { unsigned instance_divisor,src_offset,src_stride,vertex_buffer_index; };
