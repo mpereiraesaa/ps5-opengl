@@ -109,12 +109,12 @@ int main(void) {
     uint8_t work[0x10000]; memset(work,0xa5,sizeof(work));
     runtime_prepared_work_clear(work);
     for(unsigned i=0;i<sizeof(work);++i)
-        assert(work[i]==(i>=0x4000 && i<0x8000 ? 0 : 0xa5));
+        assert(work[i]==(i>=0x5000 && i<0x7000 ? 0 : 0xa5));
     agc_command_buffer_t c={(uint32_t*)(work+0x8000),(uint32_t*)(work+0xc000),
         (uint32_t*)(work+0x8100),(uint32_t*)(work+0xbfc0)};
     spy=1; flushes=0;
     assert(!runtime_prepared_work_publish(work,&c) && flushes==3);
-    assert(ranges[0]==work+0x4000 && lengths[0]==0x4000);
+    assert(ranges[0]==work+0x5000 && lengths[0]==0x2000);
     assert(ranges[1]==work+0x8000 && lengths[1]==0x100);
     assert(ranges[2]==work+0xbfc0 && lengths[2]==64);
     flushes=0; c.down=c.up-1;
