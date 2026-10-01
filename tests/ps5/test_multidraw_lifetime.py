@@ -254,6 +254,8 @@ static int submit(void *p) {
 }
 static int suspend_point(void) { ++suspends; return fail_suspend; }
 static void flush_gpu_data(const void *p, size_t n) { assert(p && (n == 8 || p == arena_memory)); }
+static unsigned publish_fences;
+static void runtime_publish_fence(void) { ++publish_fences; }
 static int sceKernelUsleep(uint32_t us) {
     assert(us == 1000 && !unmaps && !releases);
     if (++sleeps >= delay)
@@ -365,7 +367,9 @@ int main(void) {
         const struct runtime_batch_entry entry = {d, memory[i], i * 64, 64, &markers[i], 101 + i, 4, 8, 2};
         assert(runtime_batch_queue(&arena_api, &entry) == 0);
     }
+    const unsigned fences_before = publish_fences;
     assert(ps5_agc_gate2_batch_submit() == 0);
+    assert(publish_fences == fences_before + 1); /* one fence for the batch's write-backs */
     const struct runtime_batch_entry *merged = &runtime_pending[runtime_pending_head].entries[0];
     assert(merged->marker == &markers[2] && merged->expected == 103 &&
            !runtime_pending[runtime_pending_head].entries[1].submit.word_count &&
@@ -920,6 +924,7 @@ deferred = source[start:source.index(
 fence_helpers = source[source.index("static uint64_t\nps5_draw_batch_fence_submit("):source.index("static bool\nps5_memory_overlaps(")]
 deferred = deferred.replace(fence_helpers, "")
 deferred_code = code[:code.index("int main(void) {")] + r'''
+static bool ps5_flush_unfenced; /* set while a draw is staged (ps5_flush_gpu_data) */
 static unsigned scanout_waits;
 static int scanout_wait(void) { assert(locked); ++scanout_waits; return 0; }
 static int (*ps5_agc_gate2_wait_present)(void) = scanout_wait;

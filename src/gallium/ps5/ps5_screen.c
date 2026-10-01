@@ -2485,12 +2485,22 @@ ps5_hash32(const void *data, size_t size)
 static uint64_t ps5_cpu_flush_calls, ps5_cpu_flush_bytes;
 #endif
 
+/* While a draw is staged into a deferred batch, its write-backs need not
+ * wait: the batch submission fences once before the GPU reads any of them. */
+static bool ps5_flush_unfenced;
+
 static void
 ps5_flush_gpu_data(const void *address, size_t bytes)
 {
    if (!bytes)
       return;
-   util_flush_inval_range((void *)address, bytes);
+   if (ps5_flush_unfenced) {
+      const uintptr_t end = (uintptr_t)address + bytes;
+      for (uintptr_t at = (uintptr_t)address & ~(uintptr_t)63; at < end; at += 64)
+         __asm__ volatile("clflushopt (%0)" : : "r"(at) : "memory");
+   } else {
+      util_flush_inval_range((void *)address, bytes);
+   }
 #ifdef PS5_DRAW_PROFILE
    __atomic_fetch_add(&ps5_cpu_flush_calls, 1, __ATOMIC_RELAXED);
    __atomic_fetch_add(&ps5_cpu_flush_bytes, bytes, __ATOMIC_RELAXED);
@@ -11898,8 +11908,12 @@ ps5_try_deferred_draw(struct pipe_context *base,
       occlusion_query->buffer = ps5_deferred.slots[slot].occlusion_buffer;
    }
    context->last_draw_status = 0;
+#if !defined(PS5_ASYNC_NATIVE_PREP)
+   ps5_flush_unfenced = true;
+#endif
    ps5_draw_vbo_locked(base, info, drawid_offset, indirect, draws, num_draws,
                        &ps5_deferred.flush_cache, &submitted);
+   ps5_flush_unfenced = false;
    context->vertex_descriptor_table = saved[0];
    context->descriptor_storage[0] = saved[1];
    context->descriptor_storage[1] = saved[2];
@@ -16770,6 +16784,7 @@ ps5_context_destroy(struct pipe_context *base)
       base->screen->num_contexts--;
    free(context);
 }
+
 
 static struct pipe_context *
 ps5_context_create(struct pipe_screen *screen, void *priv, unsigned flags)

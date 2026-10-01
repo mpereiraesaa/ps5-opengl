@@ -917,6 +917,8 @@ static uint8_t command_out_of_space(agc_command_buffer_t *, uint32_t, void *);
 
 #if defined(AGC_RUNTIME_PACKAGES)
 static void flush_gpu_data(const void *address, size_t bytes);
+static void flush_gpu_data_unfenced(const void *address, size_t bytes);
+static void runtime_publish_fence(void);
 #include "ps5_cache_profile.h"
 #ifdef PS5_DRAW_PROFILE
 #define flush_gpu_data(address, bytes) PS5_CACHE_MEASURE(flush_gpu_data, address, bytes)
@@ -1109,19 +1111,22 @@ static void runtime_prepared_work_clear(uint8_t *memory)
     memset(memory + RUNTIME_PREPARED_MARKER_LINE, 0, 0x40);
 }
 
+/* flush is flush_gpu_data, or flush_gpu_data_unfenced for a batched draw:
+ * the batch submission fences once for all of its draws. */
 static int runtime_prepared_work_publish(uint8_t *memory,
-                                          const agc_command_buffer_t *command)
+                                          const agc_command_buffer_t *command,
+                                          void (*flush)(const void *, size_t))
 {
     if (command->bottom != (uint32_t *)(memory + 0x8000) ||
         command->top != (uint32_t *)(memory + 0xc000) ||
         command->up < command->bottom || command->down < command->up ||
         command->down > command->top)
         return -1;
-    flush_gpu_data(memory + 0x5000, RUNTIME_PREPARED_SHADER_BYTES);
-    flush_gpu_data(memory + 0x6000, RUNTIME_PREPARED_UCONFIG_BYTES);
-    flush_gpu_data(memory + RUNTIME_PREPARED_MARKER_LINE, 0x40);
-    flush_gpu_data(command->bottom, (size_t)(command->up - command->bottom) * 4);
-    flush_gpu_data(command->down, (size_t)(command->top - command->down) * 4);
+    flush(memory + 0x5000, RUNTIME_PREPARED_SHADER_BYTES);
+    flush(memory + 0x6000, RUNTIME_PREPARED_UCONFIG_BYTES);
+    flush(memory + RUNTIME_PREPARED_MARKER_LINE, 0x40);
+    flush(command->bottom, (size_t)(command->up - command->bottom) * 4);
+    flush(command->down, (size_t)(command->top - command->down) * 4);
     return 0;
 }
 
@@ -1857,6 +1862,7 @@ int ps5_agc_gate2_batch_submit(void)
         ((volatile uint64_t *)((uint8_t *)e->memory + e->bytes - 0x4000))[8] = os_time_get_nano();
     }
 #endif
+    runtime_publish_fence(); /* Completes every staged draw's write-back. */
     for (unsigned i = 0; i < runtime_batch_count; ++i) {
         ++attempted; /* A failed submit is conservatively treated as in flight. */
         if (!runtime_batch_entries[i].submit.word_count)
@@ -2866,6 +2872,20 @@ static void (flush_gpu_data)(const void *address, size_t bytes)
         __asm__ volatile("clflush (%0)" : : "r"(at) : "memory");
     __asm__ volatile("mfence" ::: "memory");
 #endif
+}
+
+/* Write back and invalidate without waiting: only for data the GPU reads
+ * after a later submission, which runtime_publish_fence() orders. */
+static void flush_gpu_data_unfenced(const void *address, size_t bytes)
+{
+    const uintptr_t end = (uintptr_t)address + bytes;
+    for (uintptr_t at = (uintptr_t)address & ~(uintptr_t)63; bytes && at < end; at += 64)
+        __asm__ volatile("clflushopt (%0)" : : "r"(at) : "memory");
+}
+
+static void runtime_publish_fence(void)
+{
+    __asm__ volatile("mfence" ::: "memory");
 }
 
 #if (defined(AGC_RENDER_TO_TEXTURE_VARIANT) || \
@@ -5024,7 +5044,14 @@ int main(void)
 #if defined(PS5_NATIVE_TITLE_RUNTIME) && defined(PS5_MULTIDRAW_BATCH) && \
     !defined(PS5_DRAW_GPU_TIMESTAMPS) && !defined(AGC_RUNTIME_DIAGNOSTICS)
     if (prepared) {
-        if (runtime_prepared_work_publish(memory, &command) != 0)
+        if (runtime_prepared_work_publish(memory, &command,
+#ifdef PS5_ASYNC_NATIVE_PREP
+                                          /* A worker's write-backs need its own fence. */
+                                          flush_gpu_data) != 0)
+#else
+                                          runtime_batch_active ? flush_gpu_data_unfenced
+                                                               : flush_gpu_data) != 0)
+#endif
             goto receipt;
     } else
 #endif
@@ -5060,6 +5087,7 @@ int main(void)
 #ifdef PS5_DRAW_GPU_TIMESTAMPS
         ((volatile uint64_t *)(memory + work_bytes - 0x4000))[8] = os_time_get_nano();
 #endif
+        runtime_publish_fence(); /* Gallium may have staged write-backs unfenced. */
         int submit_rc = agc.submit(&submit);
         PS5_PROFILE_MARK(6);
 #ifdef PS5_FRAME_SUSPEND

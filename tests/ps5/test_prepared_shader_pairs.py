@@ -114,18 +114,18 @@ int main(void) {
     agc_command_buffer_t c={(uint32_t*)(work+0x8000),(uint32_t*)(work+0xc000),
         (uint32_t*)(work+0x8100),(uint32_t*)(work+0xbfc0)};
     spy=1; flushes=0;
-    assert(!runtime_prepared_work_publish(work,&c) && flushes==5);
+    assert(!runtime_prepared_work_publish(work,&c,flush_gpu_data) && flushes==5);
     assert(ranges[0]==work+0x5000 && lengths[0]==34*8);
     assert(ranges[1]==work+0x6000 && lengths[1]==0x40);
     assert(ranges[2]==work+0x6fc0 && lengths[2]==0x40);
     assert(ranges[3]==work+0x8000 && lengths[3]==0x100);
     assert(ranges[4]==work+0xbfc0 && lengths[4]==64);
     flushes=0; c.down=c.up-1;
-    assert(runtime_prepared_work_publish(work,&c)==-1 && flushes==0);
+    assert(runtime_prepared_work_publish(work,&c,flush_gpu_data)==-1 && flushes==0);
     c.down=c.top; c.bottom++;
-    assert(runtime_prepared_work_publish(work,&c)==-1 && flushes==0);
+    assert(runtime_prepared_work_publish(work,&c,flush_gpu_data)==-1 && flushes==0);
     c.bottom--; c.top++;
-    assert(runtime_prepared_work_publish(work,&c)==-1 && flushes==0);
+    assert(runtime_prepared_work_publish(work,&c,flush_gpu_data)==-1 && flushes==0);
     return 0;
 }
 '''
