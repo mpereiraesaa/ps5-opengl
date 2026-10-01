@@ -33,9 +33,9 @@ static int munmap(void *p,size_t n) { ++unmaps; free(p); return 0; }
 static int sceKernelReleaseDirectMemory(int64_t p,size_t n) { ++releases; return 0; }
 typedef struct { uint32_t *bottom,*top,*up,*down; } agc_command_buffer_t;
 static int spy;
-static const void *ranges[3]; static size_t lengths[3];
+static const void *ranges[5]; static size_t lengths[5];
 static void flush_gpu_data(const void *p,size_t n) {
-    if(spy) { assert(flushes<3); ranges[flushes]=p; lengths[flushes]=n; }
+    if(spy) { assert(flushes<5); ranges[flushes]=p; lengths[flushes]=n; }
     ++flushes;
 }
 typedef struct { int (*create_shader)(void **,void *,void *); int (*link_shaders)(void *,void *,void *,void *,void *,uint32_t); } agc_api_t;
@@ -109,14 +109,17 @@ int main(void) {
     uint8_t work[0x10000]; memset(work,0xa5,sizeof(work));
     runtime_prepared_work_clear(work);
     for(unsigned i=0;i<sizeof(work);++i)
-        assert(work[i]==(i>=0x5000 && i<0x7000 ? 0 : 0xa5));
+        assert(work[i]==((i>=0x5000 && i<0x5000+34*8) || (i>=0x6000 && i<0x6040) ||
+                         (i>=0x6fc0 && i<0x7000) ? 0 : 0xa5));
     agc_command_buffer_t c={(uint32_t*)(work+0x8000),(uint32_t*)(work+0xc000),
         (uint32_t*)(work+0x8100),(uint32_t*)(work+0xbfc0)};
     spy=1; flushes=0;
-    assert(!runtime_prepared_work_publish(work,&c) && flushes==3);
-    assert(ranges[0]==work+0x5000 && lengths[0]==0x2000);
-    assert(ranges[1]==work+0x8000 && lengths[1]==0x100);
-    assert(ranges[2]==work+0xbfc0 && lengths[2]==64);
+    assert(!runtime_prepared_work_publish(work,&c) && flushes==5);
+    assert(ranges[0]==work+0x5000 && lengths[0]==34*8);
+    assert(ranges[1]==work+0x6000 && lengths[1]==0x40);
+    assert(ranges[2]==work+0x6fc0 && lengths[2]==0x40);
+    assert(ranges[3]==work+0x8000 && lengths[3]==0x100);
+    assert(ranges[4]==work+0xbfc0 && lengths[4]==64);
     flushes=0; c.down=c.up-1;
     assert(runtime_prepared_work_publish(work,&c)==-1 && flushes==0);
     c.down=c.top; c.bottom++;

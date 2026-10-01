@@ -1094,12 +1094,19 @@ static pthread_mutex_t runtime_shader_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t runtime_pair_lookups, runtime_pair_hot_hits;
 static uint64_t runtime_pair_scan_hits, runtime_pair_full;
 
-/* Prepared draws restore linked shader registers at 0x5000 and 0x6000 and
- * initialize the completion marker at 0x6ff0. The 0x4000 page is unused in
- * this path; shader code lives in the pair allocation. */
+/* Prepared draws restore linked shader registers at 0x5000 (34 records) and
+ * UCONFIG records at 0x6000 (at most 8), and initialize the completion marker
+ * at 0x6ff0. Every record read is written for each draw, so only these ranges
+ * are cleared and published; the 0x4000 page and the rest of the state pages
+ * are unused in this path, and shader code lives in the pair allocation. */
+#define RUNTIME_PREPARED_SHADER_BYTES (34u * 8u)
+#define RUNTIME_PREPARED_UCONFIG_BYTES 0x40u
+#define RUNTIME_PREPARED_MARKER_LINE 0x6fc0u
 static void runtime_prepared_work_clear(uint8_t *memory)
 {
-    memset(memory + 0x5000, 0, 0x2000);
+    memset(memory + 0x5000, 0, RUNTIME_PREPARED_SHADER_BYTES);
+    memset(memory + 0x6000, 0, RUNTIME_PREPARED_UCONFIG_BYTES);
+    memset(memory + RUNTIME_PREPARED_MARKER_LINE, 0, 0x40);
 }
 
 static int runtime_prepared_work_publish(uint8_t *memory,
@@ -1110,7 +1117,9 @@ static int runtime_prepared_work_publish(uint8_t *memory,
         command->up < command->bottom || command->down < command->up ||
         command->down > command->top)
         return -1;
-    flush_gpu_data(memory + 0x5000, 0x2000);
+    flush_gpu_data(memory + 0x5000, RUNTIME_PREPARED_SHADER_BYTES);
+    flush_gpu_data(memory + 0x6000, RUNTIME_PREPARED_UCONFIG_BYTES);
+    flush_gpu_data(memory + RUNTIME_PREPARED_MARKER_LINE, 0x40);
     flush_gpu_data(command->bottom, (size_t)(command->up - command->bottom) * 4);
     flush_gpu_data(command->down, (size_t)(command->top - command->down) * 4);
     return 0;
@@ -3155,6 +3164,10 @@ static int append_target_state(agc_register_t *cx, uint32_t *cx_count,
         0x318, 0x31b, 0x31c, 0x31d, 0x31e, 0x31f, 0x321, 0x323,
         0x324, 0x325, 0x390, 0x398, 0x3a0, 0x3a8, 0x3b0, 0x3b8
     };
+    /* The defaults table is fixed, so its 16 target values are looked up once
+     * per table instead of rescanning it on every draw. */
+    static const void *cached_defaults;
+    static uint32_t cached_values[16];
     agc_register_t **blocks = *(agc_register_t ***)defaults;
     uint32_t default_count = *(uint32_t *)((uint8_t *)defaults + 0x20);
     uint32_t index;
@@ -3163,6 +3176,11 @@ static int append_target_state(agc_register_t *cx, uint32_t *cx_count,
         return -1;
     for (index = 0; index < 16; ++index)
         cx[index] = (agc_register_t){target_offsets[index], 0, 0};
+    if (__atomic_load_n(&cached_defaults, __ATOMIC_ACQUIRE) == defaults) {
+        for (index = 0; index < 16; ++index)
+            cx[index].value = cached_values[index];
+        goto defaults_ready;
+    }
     /* Read each default once instead of rescanning the table for every target
      * register. Keep the first occurrence, matching the original lookup. */
     uint32_t found = 0;
@@ -3193,7 +3211,12 @@ static int append_target_state(agc_register_t *cx, uint32_t *cx_count,
     }
     if (found != 0xffffu)
         return -1;
+    for (index = 0; index < 16; ++index)
+        cached_values[index] = cx[index].value;
+    /* Async preparation workers may fill it concurrently with equal values. */
+    __atomic_store_n(&cached_defaults, defaults, __ATOMIC_RELEASE);
 
+defaults_ready:
     cx[0].value = (uint32_t)((uintptr_t)target >> 8);
     cx[1].value &= 0xfc001fffu;
     cx[2].value = (cx[2].value &
@@ -3925,8 +3948,13 @@ int main(void)
 #else
     init_rc = agc.init(8);
 #endif
-    if (init_rc == 0)
-        direct_limit = sceKernelGetDirectMemorySize();
+    if (init_rc == 0) {
+        /* A system call with a fixed answer; draws used to pay it each time. */
+        static int64_t direct_size;
+        if (!direct_size)
+            direct_size = sceKernelGetDirectMemorySize();
+        direct_limit = direct_size;
+    }
     /* libkernel_web reports zero in the payload-loader context; the proven
      * allocation contract accepts (search_start, search_end) == (0, 0). */
     if (init_rc != 0)
@@ -4478,7 +4506,10 @@ int main(void)
         runtime_depth_buffer_size >= DEPTH_BYTES)
         append_depth_target_state(cx, &cx_count, runtime_depth_buffer,
                                   runtime_stencil_buffer);
-    if (getenv("PSBC_DEBUG_IO"))
+    static int debug_io = -1; /* getenv() scans the environment; ask once. */
+    if (debug_io < 0)
+        debug_io = getenv("PSBC_DEBUG_IO") != NULL;
+    if (debug_io)
         printf("[ps5-linkage] vs-out=%08x ps-in=%08x inputs=%08x/%08x/%08x/%08x\n",
                last_register_value(cx, cx_count, 0x1b1),
                last_register_value(cx, cx_count, 0x1b6),

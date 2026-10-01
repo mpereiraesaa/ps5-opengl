@@ -4981,7 +4981,13 @@ ps5_resource_create_unlocked(struct pipe_screen *screen,
          goto primary_ready;
       }
    }
-   direct_limit = sceKernelGetDirectMemorySize();
+   {
+      /* A system call with a fixed answer; ask it once. */
+      static int64_t direct_size;
+      if (!direct_size)
+         direct_size = sceKernelGetDirectMemorySize();
+      direct_limit = direct_size;
+   }
 #ifdef PS5_PUBLIC_STENCIL_TEST
    if (templ->format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT) {
       const unsigned layers = ps5_texture_level_layers(templ, 0);
